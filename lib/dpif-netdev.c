@@ -2118,6 +2118,7 @@ megaflow_to_mark_associate(const ovs_u128 *mega_ufid, uint32_t mark)
     data->mega_ufid = *mega_ufid;
     data->mark = mark;
 
+    VLOG_ERR("======> Mark id %u associated\n", mark);
     cmap_insert(&flow_mark.megaflow_to_mark,
                 CONST_CAST(struct cmap_node *, &data->node), hash);
 }
@@ -2170,7 +2171,7 @@ mark_to_flow_associate(const uint32_t mark, struct dp_netdev_flow *flow)
                 hash_int(mark, 0));
     flow->mark = mark;
 
-    VLOG_DBG("Associated dp_netdev flow %p with mark %u\n", flow, mark);
+    VLOG_ERR("Associated dp_netdev flow %p with mark %u\n", flow, mark);
 }
 
 static bool
@@ -2334,7 +2335,7 @@ dp_netdev_flow_offload_put(struct dp_flow_offload_item *offload)
          */
         mark = megaflow_to_mark_find(&flow->mega_ufid);
         if (mark != INVALID_FLOW_MARK) {
-            VLOG_DBG("Flow has already been offloaded with mark %u\n", mark);
+            VLOG_ERR("Flow has already been offloaded with mark %u\n", mark);
             if (flow->mark != INVALID_FLOW_MARK) {
                 ovs_assert(flow->mark == mark);
             } else {
@@ -2348,6 +2349,7 @@ dp_netdev_flow_offload_put(struct dp_flow_offload_item *offload)
             VLOG_ERR("Failed to allocate flow mark!\n");
         }
     }
+    VLOG_ERR("======> In file %s line %d. Mark=%d\n", __FILE__, __LINE__, mark);
     info.flow_mark = mark;
 
     ovs_mutex_lock(&pmd->dp->port_mutex);
@@ -5930,6 +5932,7 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
 
         if ((*recirc_depth_get() == 0) &&
             dp_packet_has_flow_mark(packet, &mark)) {
+        	VLOG_ERR("==========> Mark %u recieved !!\n", mark);
             flow = mark_to_flow_find(pmd, mark);
             if (OVS_LIKELY(flow)) {
                 tcp_flags = parse_tcp_flags(packet);
@@ -6259,12 +6262,12 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
 
     /* All the flow batches need to be reset before any call to
      * packet_batch_per_flow_execute() as it could potentially trigger
-     * recirculation. When a packet matching flow ‘j’ happens to be
+     * recirculation. When a packet matching flow ???j??? happens to be
      * recirculated, the nested call to dp_netdev_input__() could potentially
      * classify the packet as matching another flow - say 'k'. It could happen
      * that in the previous call to dp_netdev_input__() that same flow 'k' had
      * already its own batches[k] still waiting to be served.  So if its
-     * ‘batch’ member is not reset, the recirculated packet would be wrongly
+     * ???batch??? member is not reset, the recirculated packet would be wrongly
      * appended to batches[k] of the 1st call to dp_netdev_input__(). */
     for (i = 0; i < n_batches; i++) {
         batches[i].flow->batch = NULL;

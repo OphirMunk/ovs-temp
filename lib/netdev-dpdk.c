@@ -32,6 +32,7 @@
 #include <rte_errno.h>
 #include <rte_eth_ring.h>
 #include <rte_ethdev.h>
+#include <rte_ethdev_driver.h>
 #include <rte_malloc.h>
 #include <rte_mbuf.h>
 #include <rte_meter.h>
@@ -65,6 +66,8 @@
 #include "timeval.h"
 #include "uuid.h"
 #include "unixctl.h"
+
+#include <execinfo.h>
 
 enum {VIRTIO_RXQ, VIRTIO_TXQ, VIRTIO_QNUM};
 
@@ -910,8 +913,10 @@ dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
                              NETDEV_RX_CHECKSUM_OFFLOAD) != 0) ?
                              DEV_RX_OFFLOAD_CHECKSUM : 0;
 
-    if (dev->hw_ol_features & NETDEV_RX_HW_CRC_STRIP) {
-        conf.rxmode.offloads |= DEV_RX_OFFLOAD_CRC_STRIP;
+    //if (dev->hw_ol_features & NETDEV_RX_HW_CRC_STRIP) {
+    //    conf.rxmode.offloads |= DEV_RX_OFFLOAD_CRC_STRIP;
+    if ((dev->hw_ol_features & NETDEV_RX_HW_CRC_STRIP) == 0) {
+        conf.rxmode.offloads |= DEV_RX_OFFLOAD_KEEP_CRC;
     }
 
     /* Limit configured rss hash functions to only those supported
@@ -1324,7 +1329,7 @@ static void
 netdev_dpdk_destruct(struct netdev *netdev)
 {
     struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
-    char devname[RTE_ETH_NAME_MAX_LEN];
+    // char devname[RTE_ETH_NAME_MAX_LEN];
 
     ovs_mutex_lock(&dpdk_mutex);
 
@@ -1333,10 +1338,11 @@ netdev_dpdk_destruct(struct netdev *netdev)
 
     if (dev->attached) {
         rte_eth_dev_close(dev->port_id);
-        if (rte_eth_dev_detach(dev->port_id, devname) < 0) {
+        // if (rte_eth_dev_detach(dev->port_id, devname) < 0) {
+        if (rte_dev_remove(rte_eth_devices[dev->port_id].device) < 0) {
             VLOG_ERR("Device '%s' can not be detached", dev->devargs);
         } else {
-            VLOG_INFO("Device '%s' has been detached", devname);
+            VLOG_INFO("Device '%s' has been detached", dev->devargs);
         }
     }
 
@@ -1603,6 +1609,75 @@ netdev_dpdk_get_port_by_mac(const char *mac_str)
 }
 
 /*
+ * Given a pattern which represents a PCI device with a group of
+ * represenotrs (e.g. '0000:08:00.0,representor=[1-2,5]') - iterate
+ * to get each device name individually, for example:
+ *
+ * 1st iteration: "0000:08:00.0"
+ * 2nd iteration: "0000:08:00.0_representor_1"
+ * 3rd iteration: "0000:08:00.0_represnetor_2"
+ * 4th iteration: "0000:08:00.0_representor_5"
+ * 5th iteration: NULL
+
+ * The order of iterator calls:
+ * 1. init_representor_name_iter(...)
+ * 2. get_next_representor_name_iter(...); // loop to get next name until NULL
+ * 3. deinit_representor_name_iter(...)
+ */
+struct representor_name_iter {
+    char *devargs;
+    struct rte_eth_devargs eth_da;
+    int last_index;
+    int max_name_len;
+};
+
+#if 0
+static char *get_next_representor_name_iter(struct representor_name_iter *iter,
+                                            char *name, int *is_representor)
+{
+    if (iter->last_index == -1) {
+        /* return the device name */
+        *is_representor = 0;
+        ovs_strzcpy(name, iter->devargs, iter->max_name_len);
+        iter->last_index = 0;
+    } else {
+        /* return next representor name if exists*/
+        if (iter->last_index < iter->eth_da.nb_representor_ports) {
+            *is_representor = 1;
+            snprintf(name, iter->max_name_len, "%s_representor_%d",
+                     iter->devargs,
+                     iter->eth_da.representor_ports[iter->last_index]);
+            (iter->last_index)++;
+        } else {
+            return NULL;
+        }
+    }
+
+    return name;
+}
+
+static void init_representor_name_iter(const char *devargs, int max_name_len,
+                                       struct representor_name_iter *iter)
+{
+    int i;
+
+    memset((void *)iter, 0, sizeof(*iter));
+    /* get device name and store it in iterator */
+    iter->devargs = xmemdup0(devargs, strlen(devargs));
+    i = strcspn(iter->devargs, ",");
+    iter->devargs[i] = 0;
+    rte_eth_devargs_parse(iter->devargs+i + 1, &iter->eth_da);
+    iter->max_name_len = max_name_len;
+    iter->last_index = -1;
+}
+
+static void deinit_representor_name_iter(struct representor_name_iter *iter)
+{
+    free(iter->devargs);
+}
+#endif
+
+/*
  * Normally, a PCI id is enough for identifying a specific DPDK port.
  * However, for some NICs having multiple ports sharing the same PCI
  * id, using PCI id won't work then.
@@ -1616,13 +1691,29 @@ static dpdk_port_t
 netdev_dpdk_process_devargs(struct netdev_dpdk *dev,
                             const char *devargs, char **errp)
 {
-    char *name;
+    char name[32];
     dpdk_port_t new_port_id = DPDK_ETH_PORT_ID_INVALID;
+    struct rte_dev_iterator iterator;
 
+    struct representor_name_iter iter;
+    char *devnamep = name;
+    int is_representor = 0;
+    // init_representor_name_iter(devargs, sizeof(name), &iter);
+    /*
+     * get a PCI address as a device name (e.g. 0000:08:00.0)
+     * or a representor name (e.g. 0000:08:00.0_representor_2)
+     * as the device name
+     */
+    //while (devnamep && !is_representor) {
+    //    devnamep = get_next_representor_name_iter(&iter,
+    //                                    name, &is_representor);
+    //}
+    // deinit_representor_name_iter(&iter);
     if (strncmp(devargs, "class=eth,mac=", 14) == 0) {
-        new_port_id = netdev_dpdk_get_port_by_mac(&devargs[14]);
+        new_port_id = netdev_dpdk_get_port_by_mac(&devargs[14]); // suggestion by Thomas: remove this function and replace it with RTE_ETH_FOREACH_MATCHING_DEV. There is a wrong assumption that the device is already probed
     } else {
-        name = xmemdup0(devargs, strcspn(devargs, ","));
+#define DEBUG_DPDK_LATEST
+#if defined DEBUG_DPDK_18_08
         if (rte_eth_dev_get_port_by_name(name, &new_port_id)
                 || !rte_eth_dev_is_valid_port(new_port_id)) {
             /* Device not found in DPDK, attempt to attach it */
@@ -1635,11 +1726,30 @@ netdev_dpdk_process_devargs(struct netdev_dpdk *dev,
                 new_port_id = DPDK_ETH_PORT_ID_INVALID;
             }
         }
-        free(name);
+#endif
+#if defined DEBUG_DPDK_LATEST
+        if (rte_dev_probe(devargs)) {
+                new_port_id = DPDK_ETH_PORT_ID_INVALID;
+        } else {
+            RTE_ETH_FOREACH_MATCHING_DEV(new_port_id, devargs, &iterator) {
+                break;
+            }
+            if (!rte_eth_dev_is_valid_port(new_port_id)) {
+                new_port_id = DPDK_ETH_PORT_ID_INVALID;
+            } else {
+                /* device successfully found */
+                dev->attached = true;
+                VLOG_INFO("Device '%s' attached to DPDK port %d", devargs, new_port_id);
+            }
+        }
+#endif
     }
-
     if (new_port_id == DPDK_ETH_PORT_ID_INVALID) {
         VLOG_WARN_BUF(errp, "Error attaching device '%s' to DPDK", devargs);
+    } else {
+        /* Attach successful */
+        dev->attached = true;
+        VLOG_INFO("Device '%s' attached to DPDK", devargs);
     }
 
     return new_port_id;
@@ -3136,11 +3246,12 @@ netdev_dpdk_detach(struct unixctl_conn *conn, int argc OVS_UNUSED,
     int ret;
     char *response;
     dpdk_port_t port_id;
-    char devname[RTE_ETH_NAME_MAX_LEN];
+    // char devname[RTE_ETH_NAME_MAX_LEN];
     struct netdev_dpdk *dev;
 
     ovs_mutex_lock(&dpdk_mutex);
 
+    //OMTODO - here argv[1] should be devargs with representor list. Then should go one by one device_names, extract port_id, and call rte_eth_dev_close
     if (rte_eth_dev_get_port_by_name(argv[1], &port_id)) {
         response = xasprintf("Device '%s' not found in DPDK", argv[1]);
         goto error;
@@ -3156,9 +3267,11 @@ netdev_dpdk_detach(struct unixctl_conn *conn, int argc OVS_UNUSED,
 
     rte_eth_dev_close(port_id);
 
-    ret = rte_eth_dev_detach(port_id, devname);
+    VLOG_ERR("------> will call now rte_dev_remove() instread of rte_eth_dev_detach()\n");
+    // ret = rte_eth_dev_detach(port_id, devname);
+    ret = rte_dev_remove(rte_eth_devices[port_id].device);
     if (ret < 0) {
-        response = xasprintf("Device '%s' can not be detached", argv[1]);
+        response = xasprintf("Device '%s' can not be removed", argv[1]);
         goto error;
     }
 
@@ -4356,19 +4469,21 @@ add_flow_rss_action(struct flow_actions *actions,
             .func = RTE_ETH_HASH_FUNCTION_DEFAULT,
             .level = 0,
             .types = ETH_RSS_IP,
-            .key_len = ARRAY_SIZE(rss_hash_default_key),
+            .key_len = ARRAY_SIZE(rss_hash_default_key), // 0
             .queue_num = netdev->n_rxq,
             .queue = rss_data->queue,
-            .key = rss_data->key,
+            .key = rss_data->key, // NULL
         },
         .key = { 0 },
         .queue = { 0 },
     };
 
+#if 1
     /* Override rss key array with default */
     for (i = 0; i < rss_data->conf.key_len; i++) {
        rss_data->key[i] = rss_hash_default_key[i];
     }
+#endif
 
     /* Override queue array with default */
     for (i = 0; i < rss_data->conf.queue_num; i++) {
@@ -4378,6 +4493,28 @@ add_flow_rss_action(struct flow_actions *actions,
     add_flow_action(actions, RTE_FLOW_ACTION_TYPE_RSS, &rss_data->conf);
 
     return &rss_data->conf;
+}
+
+#define BACKTRACE_SIZE 16
+static int my_dump_stack(void)
+{
+    void *func[BACKTRACE_SIZE];
+    char **symb = NULL;
+    int size;
+
+    size = backtrace(func, BACKTRACE_SIZE);
+    symb = backtrace_symbols(func, size);
+
+    if (symb == NULL)
+        return 0;
+
+    while (size > 0) {
+        VLOG_ERR("%d: [%s]\n", size, symb[size - 1]);
+        size --;
+    }
+
+    free(symb);
+    return 0;
 }
 
 static int
@@ -4392,7 +4529,8 @@ netdev_dpdk_add_rte_flow_offload(struct netdev *netdev,
         .group = 0,
         .priority = 0,
         .ingress = 1,
-        .egress = 0
+        .egress = 0,
+        .transfer = 1
     };
     struct flow_patterns patterns = { .items = NULL, .cnt = 0 };
     struct flow_actions actions = { .actions = NULL, .cnt = 0 };
@@ -4588,8 +4726,11 @@ end_proto_check:
 
     struct rte_flow_action_mark mark;
     mark.id = info->flow_mark;
-    add_flow_action(&actions, RTE_FLOW_ACTION_TYPE_MARK, &mark);
+    (void)mark;
+    // add_flow_action(&actions, RTE_FLOW_ACTION_TYPE_MARK, &mark);
+    add_flow_action(&actions, RTE_FLOW_ACTION_TYPE_PORT_ID, (void *)1);
 
+#if 0
     struct rte_flow_action_rss *rss;
     rss = add_flow_rss_action(&actions, netdev);
     if (!rss) {
@@ -4597,14 +4738,19 @@ end_proto_check:
         ret = -1;
         goto out;
     }
+#endif
+    (void)add_flow_rss_action;
     add_flow_action(&actions, RTE_FLOW_ACTION_TYPE_END, NULL);
 
     flow = rte_flow_create(dev->port_id, &flow_attr, patterns.items,
                            actions.actions, &error);
+#if 0
     free(rss);
+#endif
     if (!flow) {
         VLOG_ERR("rte flow creat error: %u : message : %s\n",
                  error.type, error.message);
+        // my_dump_stack();
         ret = -1;
         goto out;
     }
