@@ -168,11 +168,7 @@ static const struct rte_eth_conf port_conf = {
     .rxmode = {
         .mq_mode = ETH_MQ_RX_RSS,
         .split_hdr_size = 0,
-        .header_split   = 0, /* Header Split disabled */
-        .hw_ip_checksum = 0, /* IP checksum offload disabled */
-        .hw_vlan_filter = 0, /* VLAN filtering disabled */
-        .jumbo_frame    = 0, /* Jumbo Frame Support disabled */
-        .hw_strip_crc   = 0,
+        .offloads = 0,
     },
     .rx_adv_conf = {
         .rss_conf = {
@@ -364,6 +360,7 @@ struct dpdk_ring {
 struct ingress_policer {
     struct rte_meter_srtcm_params app_srtcm_params;
     struct rte_meter_srtcm in_policer;
+    struct rte_meter_srtcm_profile in_prof;
     rte_spinlock_t policer_lock;
 };
 
@@ -894,6 +891,8 @@ dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
     struct rte_eth_dev_info info;
     uint16_t conf_mtu;
 
+    rte_eth_dev_info_get(dev->port_id, &info);
+
     /* As of DPDK 17.11.1 a few PMDs require to explicitly enable
      * scatter to support jumbo RX. Checking the offload capabilities
      * is not an option as PMDs are not required yet to report
@@ -901,19 +900,23 @@ dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
      * (testing or code review). Listing all such PMDs feels harder
      * than highlighting the one known not to need scatter */
     if (dev->mtu > ETHER_MTU) {
-        rte_eth_dev_info_get(dev->port_id, &info);
         if (strncmp(info.driver_name, "net_nfp", 7)) {
-            conf.rxmode.enable_scatter = 1;
+            conf.rxmode.offloads |= DEV_RX_OFFLOAD_SCATTER;
         }
     }
 
     conf.intr_conf.lsc = dev->lsc_interrupt_mode;
-    conf.rxmode.hw_ip_checksum = (dev->hw_ol_features &
-                                  NETDEV_RX_CHECKSUM_OFFLOAD) != 0;
+    conf.rxmode.offloads |= ((dev->hw_ol_features &
+                             NETDEV_RX_CHECKSUM_OFFLOAD) != 0) ?
+                             DEV_RX_OFFLOAD_CHECKSUM : 0;
 
     if (dev->hw_ol_features & NETDEV_RX_HW_CRC_STRIP) {
-        conf.rxmode.hw_strip_crc = 1;
+        conf.rxmode.offloads |= DEV_RX_OFFLOAD_CRC_STRIP;
     }
+
+    /* Limit configured rss hash functions to only those supported
+     * by the eth device. */
+    conf.rx_adv_conf.rss_conf.rss_hf &= info.flow_type_rss_offloads;
 
     /* A device may report more queues than it makes available (this has
      * been observed for Intel xl710, which reserves some of them for
@@ -1932,16 +1935,18 @@ netdev_dpdk_eth_tx_burst(struct netdev_dpdk *dev, int qid,
 
 static inline bool
 netdev_dpdk_policer_pkt_handle(struct rte_meter_srtcm *meter,
+                               struct rte_meter_srtcm_profile *profile,
                                struct rte_mbuf *pkt, uint64_t time)
 {
     uint32_t pkt_len = rte_pktmbuf_pkt_len(pkt) - sizeof(struct ether_hdr);
 
-    return rte_meter_srtcm_color_blind_check(meter, time, pkt_len) ==
+    return rte_meter_srtcm_color_blind_check(meter, profile, time, pkt_len) ==
                                                 e_RTE_METER_GREEN;
 }
 
 static int
 netdev_dpdk_policer_run(struct rte_meter_srtcm *meter,
+                        struct rte_meter_srtcm_profile *profile,
                         struct rte_mbuf **pkts, int pkt_cnt,
                         bool should_steal)
 {
@@ -1953,7 +1958,8 @@ netdev_dpdk_policer_run(struct rte_meter_srtcm *meter,
     for (i = 0; i < pkt_cnt; i++) {
         pkt = pkts[i];
         /* Handle current packet */
-        if (netdev_dpdk_policer_pkt_handle(meter, pkt, current_time)) {
+        if (netdev_dpdk_policer_pkt_handle(meter, profile, pkt,
+                                                 current_time)) {
             if (cnt != i) {
                 pkts[cnt] = pkt;
             }
@@ -1975,8 +1981,8 @@ ingress_policer_run(struct ingress_policer *policer, struct rte_mbuf **pkts,
     int cnt = 0;
 
     rte_spinlock_lock(&policer->policer_lock);
-    cnt = netdev_dpdk_policer_run(&policer->in_policer, pkts,
-                                  pkt_cnt, should_steal);
+    cnt = netdev_dpdk_policer_run(&policer->in_policer, &policer->in_prof,
+                                  pkts, pkt_cnt, should_steal);
     rte_spinlock_unlock(&policer->policer_lock);
 
     return cnt;
@@ -2767,8 +2773,15 @@ netdev_dpdk_policer_construct(uint32_t rate, uint32_t burst)
     policer->app_srtcm_params.cir = rate_bytes;
     policer->app_srtcm_params.cbs = burst_bytes;
     policer->app_srtcm_params.ebs = 0;
+    err = rte_meter_srtcm_profile_config(&policer->in_prof,
+                                         &policer->app_srtcm_params);
+    if (err) {
+        VLOG_ERR("Could not create rte meter profile for ingress policer");
+        free(policer);
+        return NULL;
+    }
     err = rte_meter_srtcm_config(&policer->in_policer,
-                                    &policer->app_srtcm_params);
+                                    &policer->in_prof);
     if (err) {
         VLOG_ERR("Could not create rte meter for ingress policer");
         free(policer);
@@ -3043,13 +3056,18 @@ netdev_dpdk_get_status(const struct netdev *netdev, struct smap *args)
     smap_add_format(args, "if_descr", "%s %s", rte_version(),
                                                dev_info.driver_name);
 
-    if (dev_info.pci_dev) {
-        smap_add_format(args, "pci-vendor_id", "0x%x",
-                        dev_info.pci_dev->id.vendor_id);
-        smap_add_format(args, "pci-device_id", "0x%x",
-                        dev_info.pci_dev->id.device_id);
+    const struct rte_bus *bus;
+    const struct rte_pci_device *pci_dev;
+    bus = rte_bus_find_by_device(dev_info.device);
+    if (bus && !strcmp(bus->name, "pci")) {
+        pci_dev = RTE_DEV_TO_PCI(dev_info.device);
+        if (pci_dev) {
+            smap_add_format(args, "pci-vendor_id", "0x%u",
+                            pci_dev->id.vendor_id);
+             smap_add_format(args, "pci-device_id", "0x%x",
+                             pci_dev->id.device_id);
+        }
     }
-
     return 0;
 }
 
@@ -3727,6 +3745,7 @@ struct egress_policer {
     struct qos_conf qos_conf;
     struct rte_meter_srtcm_params app_srtcm_params;
     struct rte_meter_srtcm egress_meter;
+    struct rte_meter_srtcm_profile egress_prof;
 };
 
 static void
@@ -3749,11 +3768,21 @@ egress_policer_qos_construct(const struct smap *details,
     policer = xmalloc(sizeof *policer);
     qos_conf_init(&policer->qos_conf, &egress_policer_ops);
     egress_policer_details_to_param(details, &policer->app_srtcm_params);
+    err = rte_meter_srtcm_profile_config(&policer->egress_prof,
+                                         &policer->app_srtcm_params);
+    if (err) {
+        VLOG_ERR("Could not create rte meter profile for egress policer");
+        free(policer);
+        *conf = NULL;
+        return -err;
+    }
     err = rte_meter_srtcm_config(&policer->egress_meter,
-                                 &policer->app_srtcm_params);
+                                 &policer->egress_prof);
+
     if (!err) {
         *conf = &policer->qos_conf;
     } else {
+        VLOG_ERR("Could not create rte meter for egress policer");
         free(policer);
         *conf = NULL;
         err = -err;
@@ -3803,7 +3832,8 @@ egress_policer_run(struct qos_conf *conf, struct rte_mbuf **pkts, int pkt_cnt,
     struct egress_policer *policer =
         CONTAINER_OF(conf, struct egress_policer, qos_conf);
 
-    cnt = netdev_dpdk_policer_run(&policer->egress_meter, pkts,
+    cnt = netdev_dpdk_policer_run(&policer->egress_meter,
+                                  &policer->egress_prof, pkts,
                                   pkt_cnt, should_steal);
 
     return cnt;
@@ -4103,15 +4133,15 @@ dump_flow_pattern(struct rte_flow_item *item)
 
         VLOG_DBG("rte flow vlan pattern:\n");
         if (vlan_spec) {
-            VLOG_DBG("  Spec: tpid=0x%"PRIx16", tci=0x%"PRIx16"\n",
-                     ntohs(vlan_spec->tpid), ntohs(vlan_spec->tci));
+            VLOG_DBG("  Spec: inner_type=0x%"PRIx16", tci=0x%"PRIx16"\n",
+                     ntohs(vlan_spec->inner_type), ntohs(vlan_spec->tci));
         } else {
             VLOG_DBG("  Spec = null\n");
         }
 
         if (vlan_mask) {
-            VLOG_DBG("  Mask: tpid=0x%"PRIx16", tci=0x%"PRIx16"\n",
-                     vlan_mask->tpid, vlan_mask->tci);
+            VLOG_DBG("  Mask: inner_type=0x%"PRIx16", tci=0x%"PRIx16"\n",
+                     vlan_mask->inner_type, vlan_mask->tci);
         } else {
             VLOG_DBG("  Mask = null\n");
         }
@@ -4281,27 +4311,73 @@ add_flow_action(struct flow_actions *actions, enum rte_flow_action_type type,
     actions->cnt++;
 }
 
+/*
+ * Storage for struct rte_flow_action_rss
+ * including storage for key and queue array
+ */
+#define MAX_RSS_HASH_KEY_LENGTH  128
+#define MAX_ACTION_RSS_QUEUE_NUM 128
+/* Default RSS hash key */
+static const uint8_t rss_hash_default_key[] = {
+    0x2c, 0xc6, 0x81, 0xd1,
+    0x5b, 0xdb, 0xf4, 0xf7,
+    0xfc, 0xa2, 0x83, 0x19,
+    0xdb, 0x1a, 0x3e, 0x94,
+    0x6b, 0x9e, 0x38, 0xd9,
+    0x2c, 0x9c, 0x03, 0xd1,
+    0xad, 0x99, 0x44, 0xa7,
+    0xd9, 0x56, 0x3d, 0x59,
+    0x06, 0x3c, 0x25, 0xf3,
+    0xfc, 0x1f, 0xdc, 0x2a,
+};
+
+struct action_rss_data {
+    struct rte_flow_action_rss conf;
+    uint16_t queue[MAX_ACTION_RSS_QUEUE_NUM];
+    uint8_t key[MAX_RSS_HASH_KEY_LENGTH];
+};
+
 static struct rte_flow_action_rss *
 add_flow_rss_action(struct flow_actions *actions,
                     struct netdev *netdev) {
     int i;
-    struct rte_flow_action_rss *rss;
+    struct action_rss_data *rss_data;
 
-    rss = xmalloc(sizeof(*rss) + sizeof(uint16_t) * netdev->n_rxq);
-    /*
-     * Setting it to NULL will let the driver use the default RSS
-     * configuration we have set: &port_conf.rx_adv_conf.rss_conf.
-     */
-    rss->rss_conf = NULL;
-    rss->num = netdev->n_rxq;
-
-    for (i = 0; i < rss->num; i++) {
-        rss->queue[i] = i;
+    if (netdev->n_rxq > MAX_ACTION_RSS_QUEUE_NUM) {
+        VLOG_ERR("Num of rxq (%u) must not be greater " \
+                 "than max rss num of queues (%u)",
+                 netdev->n_rxq, MAX_ACTION_RSS_QUEUE_NUM);
+        return NULL;
     }
 
-    add_flow_action(actions, RTE_FLOW_ACTION_TYPE_RSS, rss);
+    rss_data = xmalloc(sizeof(struct action_rss_data));
+    *rss_data = (struct action_rss_data){
+        .conf = (struct rte_flow_action_rss){
+            .func = RTE_ETH_HASH_FUNCTION_DEFAULT,
+            .level = 0,
+            .types = ETH_RSS_IP,
+            .key_len = ARRAY_SIZE(rss_hash_default_key),
+            .queue_num = netdev->n_rxq,
+            .queue = rss_data->queue,
+            .key = rss_data->key,
+        },
+        .key = { 0 },
+        .queue = { 0 },
+    };
 
-    return rss;
+    /* Override rss key array with default */
+    for (i = 0; i < rss_data->conf.key_len; i++) {
+       rss_data->key[i] = rss_hash_default_key[i];
+    }
+
+    /* Override queue array with default */
+    for (i = 0; i < rss_data->conf.queue_num; i++) {
+       rss_data->queue[i] = i;
+    }
+
+    add_flow_action(actions, RTE_FLOW_ACTION_TYPE_RSS, &rss_data->conf);
+
+    return &rss_data->conf;
 }
 
 static int
@@ -4365,7 +4441,7 @@ netdev_dpdk_add_rte_flow_offload(struct netdev *netdev,
         vlan_mask.tci  = match->wc.masks.vlans[0].tci & ~htons(VLAN_CFI);
 
         /* match any protocols */
-        vlan_mask.tpid = 0;
+        vlan_mask.inner_type = 0;
 
         add_flow_pattern(&patterns, RTE_FLOW_ITEM_TYPE_VLAN,
                          &vlan_spec, &vlan_mask);
@@ -4516,6 +4592,11 @@ end_proto_check:
 
     struct rte_flow_action_rss *rss;
     rss = add_flow_rss_action(&actions, netdev);
+    if (!rss) {
+        VLOG_ERR("add_flow_rss_action error.\n");
+        ret = -1;
+        goto out;
+    }
     add_flow_action(&actions, RTE_FLOW_ACTION_TYPE_END, NULL);
 
     flow = rte_flow_create(dev->port_id, &flow_attr, patterns.items,
