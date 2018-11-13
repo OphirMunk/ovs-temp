@@ -929,8 +929,9 @@ dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
         conf.rxmode.offloads |= DEV_RX_OFFLOAD_CHECKSUM;
     }
 
-    if (dev->hw_ol_features & NETDEV_RX_HW_CRC_STRIP) {
-        conf.rxmode.offloads |= DEV_RX_OFFLOAD_CRC_STRIP;
+    if (!(dev->hw_ol_features & NETDEV_RX_HW_CRC_STRIP) &&
+         (info.rx_offload_capa & DEV_RX_OFFLOAD_KEEP_CRC)) {
+        conf.rxmode.offloads |= DEV_RX_OFFLOAD_KEEP_CRC;
     }
 
     /* Limit configured rss hash functions to only those supported
@@ -1215,6 +1216,24 @@ dpdk_dev_parse_name(const char dev_name[], const char prefix[],
     }
 }
 
+/* get the number of OVS interfaces which have the same DPDK
+ * rte device (e.g. same pci bus address). */
+static int
+netdev_dpdk_get_num_ports(struct rte_device *device)
+    OVS_REQUIRES(dpdk_mutex)
+{
+    struct netdev_dpdk *dev;
+    int count;
+
+    count = 0;
+    LIST_FOR_EACH (dev, list_node, &dpdk_list) {
+        if (rte_eth_devices[dev->port_id].device == device) {
+            count++;
+        }
+    }
+    return count;
+}
+
 static int
 vhost_common_construct(struct netdev *netdev)
     OVS_REQUIRES(dpdk_mutex)
@@ -1350,19 +1369,23 @@ static void
 netdev_dpdk_destruct(struct netdev *netdev)
 {
     struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
-    char devname[RTE_ETH_NAME_MAX_LEN];
+    struct rte_device *rte_dev;
 
     ovs_mutex_lock(&dpdk_mutex);
 
     rte_eth_dev_stop(dev->port_id);
     dev->started = false;
-
     if (dev->attached) {
+        /* Remove the port eth device */
         rte_eth_dev_close(dev->port_id);
-        if (rte_eth_dev_detach(dev->port_id, devname) < 0) {
-            VLOG_ERR("Device '%s' can not be detached", dev->devargs);
-        } else {
-            VLOG_INFO("Device '%s' has been detached", devname);
+        VLOG_INFO("Device '%s' has been removed", dev->devargs);
+        /* if this is the last port_id using this rte device
+         * remove this rte device and all its eth devices */
+        rte_dev = rte_eth_devices[dev->port_id].device;
+        if (netdev_dpdk_get_num_ports(rte_dev) == 1) {
+            if (rte_dev_remove(rte_dev) < 0) {
+                VLOG_ERR("Device '%s' can not be detached", dev->devargs);
+            }
         }
     }
 
@@ -1628,8 +1651,26 @@ netdev_dpdk_get_port_by_mac(const char *mac_str)
     return DPDK_ETH_PORT_ID_INVALID;
 }
 
+/* return the first DPDK port_id matching the devargs pattern */
+static dpdk_port_t
+netdev_dpdk_get_port_by_devargs(const char *devargs)
+{
+    struct rte_dev_iterator iterator;
+    dpdk_port_t port_id;
+
+    if (rte_dev_probe(devargs)) {
+        port_id = DPDK_ETH_PORT_ID_INVALID;
+    } else {
+        RTE_ETH_FOREACH_MATCHING_DEV(port_id, devargs, &iterator) {
+            break;
+        }
+    }
+    return port_id;
+}
+
 /*
- * Normally, a PCI id is enough for identifying a specific DPDK port.
+ * Normally, a PCI id (optionally followed by a representor number)
+ * is enough for identifying a specific DPDK port.
  * However, for some NICs having multiple ports sharing the same PCI
  * id, using PCI id won't work then.
  *
@@ -1642,28 +1683,32 @@ static dpdk_port_t
 netdev_dpdk_process_devargs(struct netdev_dpdk *dev,
                             const char *devargs, char **errp)
 {
-    char *name;
     dpdk_port_t new_port_id = DPDK_ETH_PORT_ID_INVALID;
 
     if (strncmp(devargs, "class=eth,mac=", 14) == 0) {
         new_port_id = netdev_dpdk_get_port_by_mac(&devargs[14]);
     } else {
-        name = xmemdup0(devargs, strcspn(devargs, ","));
-        if (rte_eth_dev_get_port_by_name(name, &new_port_id)
-                || !rte_eth_dev_is_valid_port(new_port_id)) {
-            /* Device not found in DPDK, attempt to attach it */
-            if (!rte_eth_dev_attach(devargs, &new_port_id)) {
-                /* Attach successful */
-                dev->attached = true;
-                VLOG_INFO("Device '%s' attached to DPDK", devargs);
-            } else {
-                /* Attach unsuccessful */
+        new_port_id = netdev_dpdk_get_port_by_devargs(devargs);
+        if (!rte_eth_dev_is_valid_port(new_port_id)) {
+            new_port_id = DPDK_ETH_PORT_ID_INVALID;
+        } else {
+            struct netdev_dpdk *dup_dev;
+
+            dup_dev = netdev_dpdk_lookup_by_port_id(new_port_id);
+            if (dup_dev) {
+                VLOG_WARN_BUF(errp, "'%s' is trying to use device '%s' "
+                               "which is already in use by '%s'",
+                          netdev_get_name(&dev->up), devargs,
+                          netdev_get_name(&dup_dev->up));
                 new_port_id = DPDK_ETH_PORT_ID_INVALID;
+            } else {
+                /* device successfully found */
+                dev->attached = true;
+                VLOG_INFO("Device '%s' attached to DPDK port %d",
+                          devargs, new_port_id);
             }
         }
-        free(name);
     }
-
     if (new_port_id == DPDK_ETH_PORT_ID_INVALID) {
         VLOG_WARN_BUF(errp, "Error attaching device '%s' to DPDK", devargs);
     }
@@ -3228,15 +3273,18 @@ static void
 netdev_dpdk_detach(struct unixctl_conn *conn, int argc OVS_UNUSED,
                    const char *argv[], void *aux OVS_UNUSED)
 {
-    int ret;
     char *response;
     dpdk_port_t port_id;
-    char devname[RTE_ETH_NAME_MAX_LEN];
     struct netdev_dpdk *dev;
+    struct rte_device *rte_dev;
+    struct rte_dev_iterator iterator;
 
     ovs_mutex_lock(&dpdk_mutex);
 
-    if (rte_eth_dev_get_port_by_name(argv[1], &port_id)) {
+    RTE_ETH_FOREACH_MATCHING_DEV(port_id, argv[1], &iterator) {
+        break;
+    }
+    if (port_id == DPDK_ETH_PORT_ID_INVALID) {
         response = xasprintf("Device '%s' not found in DPDK", argv[1]);
         goto error;
     }
@@ -3249,15 +3297,22 @@ netdev_dpdk_detach(struct unixctl_conn *conn, int argc OVS_UNUSED,
         goto error;
     }
 
-    rte_eth_dev_close(port_id);
-
-    ret = rte_eth_dev_detach(port_id, devname);
-    if (ret < 0) {
-        response = xasprintf("Device '%s' can not be detached", argv[1]);
+    rte_dev = rte_eth_devices[port_id].device;
+    if (netdev_dpdk_get_num_ports(rte_dev)) {
+        response = xasprintf("Device '%s' is being shared with other "
+                             "interfaces. Remove them before detaching.",
+                             argv[1]);
         goto error;
     }
 
-    response = xasprintf("Device '%s' has been detached", argv[1]);
+    rte_eth_dev_close(port_id);
+    if (rte_dev_remove(rte_dev) < 0) {
+        response = xasprintf("Device '%s' can not be removed", argv[1]);
+        goto error;
+    }
+
+    response = xasprintf("All devices shared with device '%s' "
+                          "have been detached", argv[1]);
 
     ovs_mutex_unlock(&dpdk_mutex);
     unixctl_command_reply(conn, response);
