@@ -1319,6 +1319,7 @@ netdev_dpdk_add_rte_flow_offload(struct netdev_rte_port *rte_port,
     int result = -1;
     struct netdev_rte_port * vport = NULL;
 
+    info->is_hwol = false; /* Assume initially no HW offload */
     result = add_dpdk_flow_patterns(&patterns, &specs, &masks, match);
     if (result) {
         flow = NULL;
@@ -1411,6 +1412,7 @@ netdev_dpdk_add_rte_flow_offload(struct netdev_rte_port *rte_port,
 
             rte_port->default_rte_flow = def_flow;
             // TODO: Roni: save flow per each vport/dpdk?
+            info->is_hwol = true;
         }
     } else { /* Previous actions cannot be offloaded to hw,
                 try offloading Mark and RSS actions */
@@ -1751,6 +1753,7 @@ netdev_vport_vxlan_add_rte_flow_offload(struct netdev_rte_port * rte_port,
             ret = -1;
             goto out;
         }
+        info->is_hwol = false;
         ufid_hw_offload_add_rte_flow(ufid_hw_offload, flow,
                                              rte_port_phy_arr[i]->dpdk_port_id,
                                              0);
@@ -1767,7 +1770,7 @@ out:
 
 int netdev_vport_flow_put(struct netdev * netdev , struct match * match,
               struct nlattr *actions OVS_UNUSED, size_t actions_len OVS_UNUSED,
-              const ovs_u128 * ufid , struct offload_info * info OVS_UNUSED,
+              const ovs_u128 * ufid , struct offload_info * info,
               struct dpif_flow_stats * flow_stats  OVS_UNUSED)
 {
     odp_port_t in_port = match->flow.in_port.odp_port;
